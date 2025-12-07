@@ -1,0 +1,242 @@
+import pandas as pd
+import yfinance as yf
+import numpy as np
+import requests
+from io import StringIO
+from fredapi import Fred
+from sklearn.linear_model import LinearRegression
+
+# -----------------------------
+# Parameters
+# -----------------------------
+start = "2000-01-01"
+end = "2025-12-01"
+
+# -----------------------------
+# Download S&P 500 data
+# -----------------------------
+sp = yf.download("^GSPC", start=start, end=end)
+sp = sp[["Close"]].copy()
+sp.reset_index(inplace=True)
+sp.columns = ["Date", "Close"]
+sp['Date'] = pd.to_datetime(sp['Date'])
+sp.set_index('Date', inplace=True)
+sp_month = sp['Close'].resample("ME").last()
+sp_mret = np.log(sp_month).diff().dropna().rename("SP_mlogret")
+
+# -----------------------------
+# FRED API setup
+# -----------------------------
+fred_api_key = 'c06648686b78cc1ee3514cd3fee59e29'  # replace with your own
+fred = Fred(api_key=fred_api_key)
+
+# -----------------------------
+# Macro series (12 indicators)
+# -----------------------------
+fred_series = {
+    "FEDFUNDS": "Federal Funds Rate",
+    "GS10": "10 Year Treasury Yield",
+    "CPIAUCSL": "CPI All Items",
+    "UNRATE": "Unemployment Rate",
+    "M2SL": "M2 Money Stock",
+    "BAMLC0A0CM": "BBB Credit Spread",
+    "PCEPI": "PCE Price Index",
+    "INDPRO": "Industrial Production Index",
+    "PAYEMS": "Total Nonfarm Payrolls",
+    "HOUST": "Housing Starts",
+    "TB3MS": "3-Month Treasury Bill Rate",
+    "CPILFESL": "Core CPI"
+}
+
+# Download macro data from FRED
+macros = {}
+for series_id, name in fred_series.items():
+    df_macro = fred.get_series(series_id, observation_start=start, observation_end=end)
+    df_macro = df_macro.to_frame(name=name)
+    macros[name] = df_macro
+
+macro = pd.concat(macros.values(), axis=1)
+macro = macro.resample("ME").last()
+
+# -----------------------------
+# Transform macro data
+# -----------------------------
+macro["CPI YoY"] = macro["CPI All Items"].pct_change(12, fill_method=None)
+macro["M2 YoY"] = macro["M2 Money Stock"].pct_change(12, fill_method=None)
+macro["FEDFUNDS_change"] = macro["Federal Funds Rate"].diff()
+
+# Keep a subset of transformed indicators plus others
+macro_m = macro[[
+    "CPI YoY",
+    "M2 YoY",
+    "Unemployment Rate",
+    "Federal Funds Rate",
+    "BBB Credit Spread",
+    "PCE Price Index",
+    "Industrial Production Index",
+    "Total Nonfarm Payrolls",
+    "Housing Starts",
+    "10 Year Treasury Yield",
+    "3-Month Treasury Bill Rate",
+    "Core CPI"
+]].dropna()
+
+# -----------------------------
+# Shiller CAPE (Shiller P/E) from multpl
+# -----------------------------
+# Fetch monthly Shiller P/E table and join into macro_m so it becomes
+# an additional feature for correlation and regression.
+try:
+    url = "https://www.multpl.com/shiller-pe/table/by-month"
+    resp = requests.get(url, headers={"User-Agent": "python-requests/2.0"}, timeout=20)
+    resp.raise_for_status()
+    tables = pd.read_html(StringIO(resp.text))
+    # The first table contains Date and P/E value by-month
+    shiller_tbl = tables[0].copy()
+    # Normalize column names in case site changes formatting
+    shiller_tbl.columns = [c.strip() for c in shiller_tbl.columns[:2]]
+    shiller_tbl = shiller_tbl.iloc[:, :2]
+    shiller_tbl.columns = ["Date", "Shiller_PE"]
+    shiller_tbl["Date"] = pd.to_datetime(shiller_tbl["Date"])
+    shiller_tbl.set_index("Date", inplace=True)
+    shiller_ser = pd.to_numeric(shiller_tbl["Shiller_PE"], errors="coerce")
+    # Ensure monthly index and take last observation each month
+    shiller_ser = shiller_ser.resample("ME").last()
+    shiller_ser.name = "Shiller_PE"
+    # Join into macro_m (will align on monthly index)
+    macro_m = macro_m.join(shiller_ser)
+    # Drop rows with any NaNs introduced by the join to keep clean training data
+    macro_m = macro_m.dropna()
+    print(f"Shiller PE loaded: {len(shiller_ser.dropna())} monthly observations; joined into macro_m.")
+except Exception as e:
+    print("Warning: could not fetch or parse Shiller PE from multpl:", e)
+    print("Continuing without Shiller_PE feature.")
+
+# -----------------------------
+# Align S&P 500 and macro
+# -----------------------------
+df = pd.concat([sp_mret, macro_m], axis=1).dropna()
+
+# -----------------------------
+# Correlation with S&P 500
+# -----------------------------
+corr_signed = df.corr().loc["SP_mlogret"]
+corr_abs_sorted = corr_signed.abs().sort_values(ascending=False)
+print("Absolute correlations with S&P 500 monthly returns:")
+print(corr_abs_sorted)
+
+# -----------------------------
+# Latest macro values
+# -----------------------------
+latest_macro = macro_m.iloc[-1]
+
+# -----------------------------
+# Simple correlation-weighted score
+# -----------------------------
+score = sum((latest_macro[col] - macro_m[col].mean()) * corr_signed[col] for col in macro_m.columns)
+print(f"Correlation-weighted score: {score:.4f}")
+
+if score > 0:
+    print("Signal: S&P 500 likely UP next month")
+else:
+    print("Signal: S&P 500 likely DOWN next month")
+
+# -----------------------------
+# Optional: Linear regression prediction
+# -----------------------------
+X = macro_m.values
+y = sp_mret.loc[macro_m.index].values
+model = LinearRegression().fit(X, y)
+pred_next_month = model.predict(latest_macro.values.reshape(1, -1))[0]
+print(f"Linear regression predicted next-month log return: {pred_next_month:.4%}")
+
+if pred_next_month > 0:
+    print("Regression signal: S&P 500 likely UP next month")
+else:
+    print("Regression signal: S&P 500 likely DOWN next month")
+
+'''
+# -----------------------------
+# Shiller PE Correlation Analysis
+# -----------------------------
+import matplotlib.pyplot as plt
+
+# Calculate rolling correlation between Shiller PE and SP500 monthly returns
+if 'Shiller_PE' in df.columns:
+    # Convert Shiller PE to log returns for correlation analysis
+    shiller_logret = np.log(df['Shiller_PE']).diff().dropna()
+    
+    # Align data for correlation
+    common_dates = shiller_logret.index.intersection(df.index)
+    shiller_logret_aligned = shiller_logret.loc[common_dates]
+    sp_mret_aligned = df.loc[common_dates, 'SP_mlogret']
+    
+    # Calculate rolling correlation (12-month window)
+    rolling_corr = shiller_logret_aligned.rolling(window=12).corr(sp_mret_aligned)
+    
+    # Calculate point-in-time correlation
+    point_corr = shiller_logret_aligned.corr(sp_mret_aligned)
+    
+    # Create figure with graph and table
+    fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(12, 10))
+    
+    # Plot 1: Rolling correlation
+    ax1.plot(rolling_corr.index, rolling_corr.values, linewidth=2, color='steelblue', label='12-Month Rolling Correlation')
+    ax1.axhline(y=0, color='red', linestyle='--', alpha=0.5, label='Zero Correlation')
+    ax1.axhline(y=point_corr, color='green', linestyle=':', linewidth=2, alpha=0.7, label=f'Overall Correlation ({point_corr:.3f})')
+    ax1.fill_between(rolling_corr.index, 0, rolling_corr.values, alpha=0.2, color='steelblue')
+    ax1.set_xlabel('Date', fontsize=11)
+    ax1.set_ylabel('Correlation Coefficient', fontsize=11)
+    ax1.set_title('Shiller PE vs S&P 500 Monthly Returns: Rolling 12-Month Correlation', fontsize=13, fontweight='bold')
+    ax1.grid(True, alpha=0.3)
+    ax1.legend(loc='best', fontsize=10)
+    
+    # Plot 2: Table of correlation statistics
+    ax2.axis('off')
+    
+    # Prepare correlation statistics
+    stats_data = [
+        ['Metric', 'Value'],
+        ['Overall Correlation', f'{point_corr:.4f}'],
+        ['Rolling Correlation Mean', f'{rolling_corr.mean():.4f}'],
+        ['Rolling Correlation Std Dev', f'{rolling_corr.std():.4f}'],
+        ['Rolling Correlation Min', f'{rolling_corr.min():.4f}'],
+        ['Rolling Correlation Max', f'{rolling_corr.max():.4f}'],
+        ['Observations', f'{len(shiller_logret_aligned)}'],
+        ['Sample Period', f'{shiller_logret_aligned.index[0].strftime("%Y-%m")} to {shiller_logret_aligned.index[-1].strftime("%Y-%m")}'],
+    ]
+    
+    table = ax2.table(cellText=stats_data, cellLoc='left', loc='center',
+                     colWidths=[0.4, 0.4])
+    table.auto_set_font_size(False)
+    table.set_fontsize(10)
+    table.scale(1, 2)
+    
+    # Style header row
+    for i in range(2):
+        table[(0, i)].set_facecolor('#4472C4')
+        table[(0, i)].set_text_props(weight='bold', color='white')
+    
+    # Alternate row colors
+    for i in range(1, len(stats_data)):
+        for j in range(2):
+            if i % 2 == 0:
+                table[(i, j)].set_facecolor('#E7E6E6')
+            else:
+                table[(i, j)].set_facecolor('#F2F2F2')
+    
+    ax2.set_title('Correlation Statistics Summary', fontsize=13, fontweight='bold', pad=20)
+    
+    plt.tight_layout()
+    plt.show()
+    
+    print("\n" + "="*60)
+    print("SHILLER PE CORRELATION ANALYSIS")
+    print("="*60)
+    print(f"Overall Correlation (Shiller PE vs SP500 Monthly Returns): {point_corr:.4f}")
+    print(f"Rolling Correlation Mean (12-month): {rolling_corr.mean():.4f}")
+    print(f"Rolling Correlation Range: [{rolling_corr.min():.4f}, {rolling_corr.max():.4f}]")
+    print("="*60)
+else:
+    print("Warning: Shiller PE data not available for correlation analysis.")
+    '''
