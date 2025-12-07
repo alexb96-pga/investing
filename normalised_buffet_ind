@@ -1,0 +1,131 @@
+#S&P500 / GDP
+
+import numpy as np
+import yfinance as yf
+import pandas as pd
+import matplotlib.pyplot as plt
+from fredapi import Fred
+
+# FRED API key (get one from https://fred.stlouisfed.org/docs/api/api_key.html)
+fred_api_key = 'c06648686b78cc1ee3514cd3fee59e29'
+
+# Initialize FRED API
+fred = Fred(api_key=fred_api_key)
+
+# Fetch Wilshire 5000 data (proxy for total US stock market value)
+SP_500_data = yf.download("^GSPC", period="max")
+SP_500_data = SP_500_data['Close']
+SP_500_data.name = 'SP_500'
+
+# Fetch US GDP data from FRED
+gdp_data = fred.get_series('GDP', period="max")
+gdp_data = gdp_data.rename('GDP')
+
+# Convert GDP data to quarterly frequency (if not already)
+gdp_data = gdp_data.resample('QE').last()
+
+# Interpolate GDP data to daily frequency
+gdp_data_daily = gdp_data.resample('D').interpolate(method='linear')
+
+# Align the dates of Wilshire 5000 and GDP data
+combined_data = pd.concat([SP_500_data, gdp_data_daily], axis=1).dropna()
+
+# Ensure correct column names after concatenation
+combined_data.columns = ['SP_500', 'GDP']
+
+# Calculate the Buffett Indicator (Stock Market Value / GDP)
+combined_data['Buffett_Indicator'] = combined_data['SP_500'] / combined_data['GDP']
+
+# Apply a rolling window to smooth the Buffett Indicator (adjust window size if needed)
+window_size = 180  # You can adjust this size to smooth more or less
+smoothed_buffett = combined_data['Buffett_Indicator'].rolling(window=window_size).mean()
+
+# Drop NaN values caused by the rolling window
+smoothed_buffett = smoothed_buffett.dropna()
+
+# Linear regression to get a simple trend line
+x_data = np.arange(len(smoothed_buffett))  # Use numerical x-values for fitting
+y_data = smoothed_buffett.values
+
+# Fit the linear model (simple linear regression)
+params = np.polyfit(x_data, y_data, 1)  # Fit a linear model (degree 1)
+trend_line = np.polyval(params, x_data)  # Generate the trend line
+
+# Calculate the standard deviation of the smoothed Buffett Indicator
+std_dev = np.std(smoothed_buffett)
+
+# Create lines for 2, 1, 0, -1, and -2 standard deviations away from the trend line
+upper_2sd = trend_line + 2 * std_dev
+upper_1sd = trend_line + std_dev
+lower_1sd = trend_line - std_dev
+lower_2sd = trend_line - 2 * std_dev
+
+# Normalize the Buffett Indicator: z-score normalization
+normalized_buffett = (smoothed_buffett - trend_line) / std_dev
+normalized_trend = np.zeros_like(normalized_buffett)  # Trend line normalized to 0
+normalized_upper_2sd = np.ones_like(normalized_buffett) * 2  # +2 SD normalized to 2
+normalized_upper_1sd = np.ones_like(normalized_buffett) * 1  # +1 SD normalized to 1
+normalized_lower_1sd = np.ones_like(normalized_buffett) * -1  # -1 SD normalized to -1
+normalized_lower_2sd = np.ones_like(normalized_buffett) * -2  # -2 SD normalized to -2
+
+# Define a function to determine line color based on standard deviations
+def get_line_color(value, trend, std_dev):
+    if value > trend + 2 * std_dev:
+        return '#FF3030'  # Bright Red (Strongly Overvalued)
+    elif value > trend + std_dev:
+        return '#FF6A6A'  # Slightly Darker Red (Overvalued)
+    elif value > trend:
+        return '#8B0000'  # Dark Red to Black (Fairly Valued - Overvalued)
+    elif value >= trend - std_dev:
+        return '#006400'  # Black to Dark Green (Fairly Valued - Undervalued)
+    elif value >= trend - 2 * std_dev:
+        return '#66CDAA'  # Slightly Lighter Green (Undervalued)
+    else:
+        return '#32CD32'  # Bright Green (Strongly Undervalued)
+
+# Plot the normalized Buffett Indicator with the trend line and standard deviation lines
+plt.figure(figsize=(12, 6))
+
+
+
+# Plot the smoothed Buffett Indicator with color-changing line
+for i in range(1, len(smoothed_buffett)):
+    plt.plot(smoothed_buffett.index[i-1:i+1], normalized_buffett[i-1:i+1], color=get_line_color(smoothed_buffett.iloc[i], trend_line[i], std_dev), lw=2)
+
+# Plot the trend line (normalized)
+plt.plot(smoothed_buffett.index, normalized_trend, label='Normalized Trend Line', color='red', linestyle='--')
+
+# Plot the standard deviation lines (normalized)
+plt.plot(smoothed_buffett.index, normalized_upper_2sd, label='+2 Standard Deviations', color='orange', linestyle='--')
+plt.plot(smoothed_buffett.index, normalized_upper_1sd, label='+1 Standard Deviation', color='orange', linestyle='--')
+plt.plot(smoothed_buffett.index, normalized_lower_1sd, label='-1 Standard Deviation', color='orange', linestyle='--')
+plt.plot(smoothed_buffett.index, normalized_lower_2sd, label='-2 Standard Deviations', color='orange', linestyle='--')
+
+# Add labels to regions
+plt.text(smoothed_buffett.index[-1], 2.1, "Strongly Overvalued", color='red', fontsize=12, ha='left')
+plt.text(smoothed_buffett.index[-1], 1.3, "Overvalued", color='#FF6A6A', fontsize=12, ha='left')
+plt.text(smoothed_buffett.index[-1], 0.7, "Fairly Valued (Overvalued)", color='#8B0000', fontsize=12, ha='left')
+plt.text(smoothed_buffett.index[-1], -0.3, "Fairly Valued (Undervalued)", color='#006400', fontsize=12, ha='left')
+plt.text(smoothed_buffett.index[-1], -1.3, "Undervalued", color='#66CDAA', fontsize=12, ha='left')
+plt.text(smoothed_buffett.index[-1], -2.1, "Strongly Undervalued", color='green', fontsize=12, ha='left')
+
+plt.title('Normalized Buffett Indicator with Trend and Standard Deviations')
+plt.xlabel('Date')
+plt.ylabel('Normalized Value')
+plt.grid(True)
+plt.legend()
+plt.show()
+
+# Print the fitted linear model parameters and standard deviation
+print(f"Fitted linear model: slope = {params[0]}, intercept = {params[1]}")
+print(f"Standard Deviation: {std_dev}")
+
+'''# Plot the S&P 500 chart
+plt.figure(figsize=(12, 6))
+plt.plot(SP_500_data.index, SP_500_data, label='S&P 500', color='blue')
+plt.title('S&P 500 Chart from 1950 to 2025')
+plt.xlabel('Date')
+plt.ylabel('S&P 500 Index Value')
+plt.grid(True)
+plt.legend()
+plt.show()'''
